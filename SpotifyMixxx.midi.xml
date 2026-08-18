@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<MixxxControllerPreset schemaVersion="1" mixxxVersion="2.5">
+    <info>
+        <name>SpotifyMixxx</name>
+        <author>Community project</author>
+        <description>
+            Loads SpotifyMixxx.js on the SpotifyMixxx IAC virtual MIDI port.
+            No physical DJ controller controls are mapped here.
+        </description>
+    </info>
+
+    <controller id="SpotifyMixxx">
+        <scriptfiles>
+            <file filename="SpotifyMixxx.js" functionprefix="SpotifyMixxx"/>
+        </scriptfiles>
+        <controls/>
+    </controller>
+</MixxxControllerPreset>

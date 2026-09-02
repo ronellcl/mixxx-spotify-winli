@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 spotify_bridge.py
 
-Small macOS Spotify bridge.
+Cross-platform Spotify bridge for Mixxx.
 
 Two modes:
   1) Listener mode (default):
        ./spotify_bridge.py
-     Listens to the IAC MIDI port "SpotifyMixxx" and translates commands
-     from Mixxx into local Spotify.app AppleScript commands.
+     Listens to a virtual MIDI port "SpotifyMixxx" and translates commands
+     from Mixxx into local Spotify playback commands (the backend depends on
+     the OS: AppleScript on macOS, SMTC on Windows, D-Bus MPRIS on Linux).
 
   2) Manual CLI mode:
        ./spotify_bridge.py play
@@ -20,8 +22,10 @@ Two modes:
        ./spotify_bridge.py next
        ./spotify_bridge.py previous
 
-Dependency:
-    python3 -m pip install python-rtmidi
+Dependencies:
+    python3 -m pip install python-rtmidi      (all platforms)
+    python3 -m pip install libspotifyctl      (Windows)
+    python3 -m pip install dbus-python        (Linux)
 
 MIDI protocol expected from SpotifyMixxx.js:
     Note 0x10 velocity > 0  -> PLAY
@@ -30,11 +34,12 @@ MIDI protocol expected from SpotifyMixxx.js:
     CC   0x20 value 0..127  -> Spotify volume 0..100
 """
 
+import platform
 import queue
-import subprocess
 import sys
 import threading
 import time
+
 
 MIDI_PORT_NAME = "SpotifyMixxx"
 
@@ -44,58 +49,34 @@ NOTE_CUE = 0x12
 CC_VOLUME = 0x20
 
 
-def spotify(script: str) -> str:
-    result = subprocess.run(
-        ["osascript", "-e", f'tell application "Spotify" to {script}'],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "osascript failed")
-    return result.stdout.strip()
+def get_controller():
+    """Return the backend suited to the current OS."""
+    system = platform.system().lower()
 
+    if system == "windows":
+        from spotify_backends.windows import WindowsSpotifyController
+        return WindowsSpotifyController()
 
-def do_play():
-    spotify("play")
+    if system == "linux":
+        from spotify_backends.linux import LinuxSpotifyController
+        return LinuxSpotifyController()
 
+    if system == "darwin":
+        from spotify_backends.macos import MacSpotifyController
+        return MacSpotifyController()
 
-def do_pause():
-    spotify("pause")
-
-
-def do_cue():
-    spotify("pause")
-    spotify("set player position to 0")
-
-
-def do_volume(volume: int):
-    volume = max(0, min(100, int(volume)))
-    spotify(f"set sound volume to {volume}")
-
-
-def do_seek(position: float):
-    spotify(f"set player position to {float(position)}")
-
-
-def print_status():
-    state = spotify("get player state")
-    position = float(spotify("get player position"))
-    duration_ms = int(spotify("get duration of current track"))
-    title = spotify("get name of current track")
-    artist = spotify("get artist of current track")
-    print(f"{artist} - {title}")
-    print(f"{position:.1f} / {duration_ms / 1000.0:.1f} sec")
-    print(state)
+    raise RuntimeError(f"Unsupported platform: {system}")
 
 
 class MidiSpotifyBridge:
     """
     MIDI callback stays lightweight. Transport commands are queued.
     Volume messages are coalesced so dragging a Mixxx gain knob cannot
-    create a large backlog of osascript processes.
+    create a large backlog of Spotify commands.
     """
 
-    def __init__(self):
+    def __init__(self, controller):
+        self.controller = controller
         self.commands = queue.Queue()
         self._volume_lock = threading.Lock()
         self._pending_volume = None
@@ -126,19 +107,22 @@ class MidiSpotifyBridge:
 
             try:
                 if command == "play":
-                    do_play()
+                    self.controller.play()
                 elif command == "pause":
-                    do_pause()
+                    self.controller.pause()
                 elif command == "cue":
-                    do_cue()
+                    self.controller.cue()
 
                 volume = self.take_pending_volume()
                 if volume is not None and volume != last_volume:
-                    do_volume(volume)
+                    self.controller.volume(volume)
                     last_volume = volume
 
             except Exception as exc:
-                print(f"[SpotifyMixxx] Spotify command failed: {exc}", file=sys.stderr)
+                print(
+                    f"[SpotifyMixxx] Spotify command failed: {exc}",
+                    file=sys.stderr,
+                )
 
     def midi_callback(self, event, _data=None):
         message, _delta_time = event
@@ -172,8 +156,11 @@ class MidiSpotifyBridge:
 def find_port(midi_in, wanted: str):
     ports = midi_in.get_ports()
 
-    # Prefer an exact-ish suffix/substring match because macOS commonly
-    # exposes IAC ports as "IAC Driver SpotifyMixxx".
+    # Prefer an exact-ish suffix/substring match. The virtual MIDI port name
+    # differs per platform:
+    #   macOS:  "IAC Driver SpotifyMixxx"
+    #   Windows:"loopMIDI Port"  (renamed to SpotifyMixxx)
+    #   Linux:  ALSA virtual port
     matches = [(i, name) for i, name in enumerate(ports) if wanted.lower() in name.lower()]
 
     if not matches:
@@ -198,6 +185,9 @@ def listen():
         )
         sys.exit(2)
 
+    controller = get_controller()
+    print(f"[SpotifyMixxx] Spotify backend: {controller.name}")
+
     midi_in = rtmidi.MidiIn()
     match = find_port(midi_in, MIDI_PORT_NAME)
     if match is None:
@@ -206,7 +196,7 @@ def listen():
     port_index, port_name = match
     midi_in.open_port(port_index)
 
-    bridge = MidiSpotifyBridge()
+    bridge = MidiSpotifyBridge(controller)
     worker = threading.Thread(target=bridge.worker, daemon=True)
     worker.start()
 
@@ -224,6 +214,7 @@ def listen():
         bridge._running = False
         midi_in.cancel_callback()
         midi_in.close_port()
+        controller.close()
 
 
 def usage():
@@ -253,43 +244,47 @@ def main():
     command = sys.argv[1].lower()
 
     try:
+        controller = get_controller()
+
         if command == "play":
-            do_play()
+            controller.play()
 
         elif command == "pause":
-            do_pause()
+            controller.pause()
 
         elif command == "playpause":
-            spotify("playpause")
+            controller.playpause()
 
         elif command == "cue":
-            do_cue()
+            controller.cue()
 
         elif command == "seek":
             if len(sys.argv) != 3:
                 raise ValueError("seek requires position in seconds")
-            do_seek(float(sys.argv[2]))
+            controller.seek(float(sys.argv[2]))
 
         elif command == "volume":
             if len(sys.argv) != 3:
                 raise ValueError("volume requires a value from 0 to 100")
-            do_volume(int(sys.argv[2]))
+            controller.volume(int(sys.argv[2]))
 
         elif command == "getvolume":
-            print(spotify("get sound volume"))
+            print(controller.get_volume())
 
         elif command == "status":
-            print_status()
+            print(controller.status())
 
         elif command == "next":
-            spotify("next track")
+            controller.next()
 
         elif command == "previous":
-            spotify("previous track")
+            controller.previous()
 
         else:
             usage()
             sys.exit(1)
+
+        controller.close()
 
     except (ValueError, RuntimeError) as exc:
         print(exc, file=sys.stderr)
